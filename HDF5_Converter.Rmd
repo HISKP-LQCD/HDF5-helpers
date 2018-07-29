@@ -1,0 +1,220 @@
+---
+title: "Pandas HDF5 to R"
+author: "Martin Ueding"
+date: "27 November 2017"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Motivation
+
+Markus' subduction code is written in Python using the Pandas library. Said library brings the “data frame” concept into Python; an additional feature is the hierarchical multi index (*HMI* from here on). Pandas can store data to HDF5, but it does this in a seemingly strange way. This format cannot readily be imported into R-hadron, therefore we need to massage it into the right structure first. This notebook will contain a function to do the needed work.
+
+# Exploring the data
+
+```{r}
+library(rhdf5)
+```
+
+A sample file produced with the subduction code has the following structure:
+
+```{r}
+filename <- 'C20_p1_A1.h5'
+knitr::kable(h5ls('C20_p1_A1.h5'))
+```
+
+There are a couple of concepts:
+
+`axis`
+:   We store 2D data, therefore we have rows and columns. `axis0` describes the columns, though this seems unusual. `axis1` describes the rows.
+
+`label` and `level`
+:   A “factor” in statistics is discrete variable, it can be nominal or ordinal, the latter having an ordering. In the process of “coding” one assigns a certain value an index. Say you have “male” and “female” and code this with “0” and “1” in your data. We would call $\{ \mathrm{male}, \mathrm{female} \}$ the “levels” and ${0, 1}$ the unique “labels”, because that is what you assigned to the levels. The data then is represented by the labels only, because we can always just get the levels back.
+
+:   Pandas stores the row and column names as such factors, even if they are just the numbers from 1 to $N$. The number of labels in a factor matches the number of rows (or column) that this factor belongs to.
+
+`block_items`
+:   We haven't figured that out yet. It seems to be redundant for our needs.
+
+`block_values`
+:   The actual matrix of values, so in R language this would be `as.matrix(df)` for some `data.frame` called `df`.
+
+There are a couple of lengths here:
+
+33
+:   The number of combinations of indices that we have. This number depends on the number irreps, $\Gamma$ structures and the like.
+
+32
+:   Number of configurations. It is a bit unfortunate, but with a bit of care we should be able to figure this out.
+
+48
+:   Halved time extent of the lattice
+
+1536
+:   Since $32 \cdot 48 = 1536$, this is the number of result values (time slice × configuration).
+
+R-hadron uses a 2D array for storing the “time slice × configuration” array, so we want to do the same thing here.
+
+# Implementation
+
+## Step by step
+
+We will first start to lay out the individual pieces and then wrap it up in one convenient function which does all the magic.
+
+### Loading data
+
+Loading the data gives us a list with the names (“dict” with “keys” in Python nomenclature) that we would expect:
+
+```{r}
+data <- h5read(filename, 'data')
+names(data)
+```
+
+These warnings do not look good, we will have to check whether they are a problem later on.
+
+### Payload
+
+Basically we now want to create a data frame which has 2D arrays as values. Then it has a bunch of columns which have all the `axis1` indices as columns. We want to use the “long format” here, so there is no fancy HMI, it will be a repetition that later on has to be worked with the `dplyr` package, which is really great at that.
+
+The `block0_values` contains real and imaginary part. They are separated, therefore we first combine them into one block.
+
+```{r}
+block <- data$block0_values$r + 1i * data$block0_values$i
+```
+
+We are also now rid of the additional hierarchy and can mold this into a list of matrices. The version with `apply(block, 1, ...)` did not allow us to return a list, so instead we do the following with indices.
+
+```{r}
+# Lattice time extent
+t <- 48
+block.list <- lapply(1:ncol(block), function (i) t(matrix(block[ , i], nrow = t)))
+```
+
+Now we have a list with matrices. Perhaps one has to transpose the data structure in order to get the right row-major or column-major layout.
+
+### Meta data
+
+From here on we just need to convert the `axis1` elements into factors and add them to the `block.list` data structure. Let's take the 8th axis as an example. Its levels (the values that it can possible take) are these:
+
+```{r}
+data$axis1_level8
+```
+
+The *indices* of the levels that are taken by the 33 data points are the following:
+
+```{r}
+data$axis1_label8
+```
+
+This list is 0-indexed, R uses 1-indexing. We want to “inflate” this relation now and then let R “deflate” it using the `factor` again:
+
+```{r}
+key8 <- factor(x = data$axis1_level8[data$axis1_label8 + 1], levels = data$axis1_level8)
+key8
+```
+
+That's exactly what we want. A 33 element long thing that we can use as a column in our resulting data frame.
+
+We would ideally like to convert all meta data automatically, no matter how many there are.
+
+```{r}
+meta.cols <- sum(startsWith(names(data), 'axis1_label'))
+```
+
+
+### Test assembly
+
+We can try to assemble a data frame with this before we cast it into a function. [Hadley Wickam notes](https://stat.ethz.ch/pipermail/r-help/2007-February/125569.html) that the `data.frame` function will convert its arguments into `vector`, so we cannot use that but must rather build up the data frame by columns.
+
+```{r}
+df <- data.frame(dummy = 1:length(key8))
+df$key8 <- key8
+df$payload <- block.list
+df$dummy <- NULL
+
+knitr::kable(df)
+```
+
+We see that this works. Cool!
+
+## Convenient function
+
+We want to have a single function that just does the whole job. So here it is. Not sure whether you use Roxygen, but classic TeX-style R documentation can be generated from this using `roxygen2::roxygenise()`.
+
+```{r}
+#' Reads a Pandas HDF5 file from the contraction code.
+#'
+#' @param filename Path to HDF5 file
+#' @param root Name of the root element to read from
+read.pandas.hdf5 <- function (filename, root = 'data') {
+    # Load the data and extract the relevant HDF5 entry.
+    data <- h5read(filename, root)
+    
+    # Extract the number of time-slices.
+    t <- length(data$axis0_level1)
+    
+    # Convert the payload into complex numbers.
+    block <- data$block0_values$r + 1i * data$block0_values$i
+    
+    # Convert each row in the payload into a 2D matrix and then form a list
+    # from all of the rows.
+    block.list <- lapply(1:ncol(block), function (i) t(matrix(block[ , i], nrow = t)))
+    
+    # Find out how many axis1 elements there are.
+    num.meta.cols <- sum(startsWith(names(data), 'axis1_label'))
+    
+    # We need to have a dummy variable to initialize the `data.frame` because
+    # otherwise it would not have the correct length. Also the function
+    # convertes, this would destroy our matrices and factors.
+    df <- data.frame(dummy = 1:length(block.list))
+    
+    # Iterate through the meta data colums, extract them from the data
+    # structure, “inflate” them and add them as `factor` objects to the
+    # data frame.
+    for (i in 0:(num.meta.cols - 1)) {
+        level.name <- sprintf('axis1_level%d', i)
+        label.name <- sprintf('axis1_label%d', i)
+        col.name <- sprintf('C%d', i)
+        
+        level <- data[[level.name]]
+        label <- data[[label.name]]
+        
+        df[col.name] <- factor(x = level[label + 1], levels = level)
+    }
+    
+    # We want to have the payload at the end, so we just add it here.
+    df$payload <- block.list
+    
+    # The dummy is not needed any more, we can delete it.
+    df$dummy <- NULL
+    
+    return (df)
+}
+```
+
+Try it out:
+
+```{r}
+test <- read.pandas.hdf5(filename)
+test
+```
+
+# Sanity check
+
+If the data was extracted correctly, plotting a single correlator should give a meaningful picture.
+
+```{r}
+one.corr <- test$payload[[1]]
+m <- apply(one.corr, 2, mean)
+plot(Re(m), log = 'y',
+     main = 'Correlator for some quantum numbers',
+     xlab = 'Time slice',
+     ylab = 'Real part')
+```
+
+This looks sensible, so likely it is correct. Also the matrix dimensions are *configuration* and *time slice*, just as in R-hadron.
